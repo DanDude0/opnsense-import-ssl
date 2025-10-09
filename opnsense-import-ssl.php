@@ -1,7 +1,7 @@
 #!/usr/bin/env php
 <?php
 /*
- * Copyright (C) 2024 Sheridan Computers Limited.
+ * Copyright (C) 2024-2025 Sheridan Computers Limited.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions are met:
@@ -29,6 +29,30 @@ require_once "config.inc";
 require_once "certs.inc";
 require_once "util.inc";
 
+// helper: does $certInfo cover $host via SAN or CN (wildcards allowed)?
+$coversHost = function(array $certInfo, string $host): bool {
+    // SANs
+    $sansStr = $certInfo['extensions']['subjectAltName'] ?? '';
+    if ($sansStr) {
+        foreach (array_map('trim', explode(',', $sansStr)) as $san) {
+            if (stripos($san, 'DNS:') === 0) {
+                $dns = substr($san, 4);
+                if (strcasecmp($dns, $host) === 0) return true;
+                if (strpos($dns, '*.') === 0) {
+                    $suffix = substr($dns, 1);
+                    if (substr($host, -strlen($suffix)) === $suffix &&
+                        substr_count($host, '.') >= substr_count($suffix, '.')) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    // CN fallback
+    $cn = $certInfo['subject']['CN'] ?? null;
+    return is_string($cn) && strcasecmp($cn, $host) === 0;
+};
+
 // ensure running from cli
 if ('cli' !== php_sapi_name()) {
     echo "This script must be run from the command line.\r\n";
@@ -42,9 +66,6 @@ if (4 !== $argc) {
     );
     die(1);
 }
-
-// name of this script (will appear in cert description)
-$cmd = end(explode('/', $argv[0]));
 
 // simple cert verification
 if (! file_exists($argv[1])) {
@@ -65,8 +86,26 @@ if (! file_exists($argv[2])) {
 }
 
 $key = trim(file_get_contents($argv[2]));
-if (! preg_match('/^-----BEGIN( | RSA | EC | DSA | ED25519 )PRIVATE KEY-----(.*)-----END\1PRIVATE KEY-----$', $key)) {
-    echo "The private key does not appear to be valid\r\n";
+
+/**
+ * Accept:
+ *   -----BEGIN PRIVATE KEY-----
+ *   -----BEGIN ENCRYPTED PRIVATE KEY-----
+ *   -----BEGIN RSA PRIVATE KEY----- / EC / DSA
+ * Body is base64 across multiple lines.
+ * END line must mirror BEGIN line.
+ */
+$re = '/\A'
+    . '-----BEGIN '
+    . '((?:ENCRYPTED )?)'           // \1 optional "ENCRYPTED "
+    . '(?:(RSA|EC|DSA) )?'          // \2 optional algorithm (PKCS#1)
+    . 'PRIVATE KEY-----\r?\n'
+    . '([A-Za-z0-9+\/=\r\n]+)'      // base64 body
+    . '\r?\n-----END \1(?:\2 )?PRIVATE KEY-----'
+    . '\s*\z/';
+
+if (!preg_match($re, $key)) {
+    echo "The private key does not appear to be a valid PEM PRIVATE KEY block\r\n";
     die(1);
 }
 
@@ -84,21 +123,59 @@ $allowedIssuers = [
     'O=Let\'s Encrypt, CN=R3, C=US',
     'O=Let\'s Encrypt, CN=R10, C=US',
     'O=Let\'s Encrypt, CN=R11, C=US',
+    'O=Let\'s Encrypt, CN=R13, C=US',
 ];
 
 $issuer = trim(cert_get_issuer($cert, false));
-if (! in_array($issuer, $allowedIssuers)) {
+if (! in_array($issuer, $allowedIssuers, true)) {
     echo sprintf("The certificate issuer \"%s\" is not valid.\r\n", $issuer);
     die(1);
 }
 
 // check cert matches domain
 $host = trim($argv[3]);
-$subject = trim(cert_get_subject($cert, false));
-if (strcmp($subject, "CN=$host") <> 0) {
+$ci = openssl_x509_parse($cert);
+$validForHost = false;
+
+// 1. Check SANs first
+if (!empty($ci['extensions']['subjectAltName'])) {
+    // e.g. "DNS:example.com, DNS:www.example.com"
+    $sans = array_map('trim', explode(',', $ci['extensions']['subjectAltName']));
+    foreach ($sans as $san) {
+        if (stripos($san, 'DNS:') === 0) {
+            $dns = substr($san, 4);
+            if (strcasecmp($dns, $host) === 0) {
+                $validForHost = true;
+                break;
+            }
+            // wildcard support, e.g. *.example.com
+            if (strpos($dns, '*.') === 0) {
+                $suffix = substr($dns, 1); // ".example.com"
+                if (substr($host, -strlen($suffix)) === $suffix &&
+                    substr_count($host, '.') >= substr_count($suffix, '.')) {
+                    $validForHost = true;
+                    break;
+                }
+            }
+        }
+    }
+}
+
+// 2. Fall back to CN if no SANs or no match
+if (!$validForHost) {
+    $cn = $ci['subject']['CN'] ?? null;
+    if (is_string($cn) && strcasecmp($cn, $host) === 0) {
+        $validForHost = true;
+    }
+}
+
+// 3. Fail if still not valid
+if (!$validForHost) {
+    $subject = trim(cert_get_subject($cert, false));
     echo sprintf(
-        "Certificate invalid domain '%s' specified, this certificate is for '%s'.\r\n",
-        $host, ltrim($subject, 'CN=')
+        "Certificate invalid domain '%s' specified. Subject is '%s'.\r\n",
+        $host,
+        $subject
     );
     die(1);
 }
@@ -114,13 +191,17 @@ cert_import($certData, $cert, $key);
 
 // check if certificate already exists
 $certRefId = null;
+
+// ensure cert store exists
+if (!isset($config['cert']) || !is_array($config['cert'])) {
+    $config['cert'] = [];
+}
 $certStore = &$config['cert'];
-if (null !== $certStore) {
-    foreach ($certStore as $existingCert) {
-        if (strcmp($existingCert['crt'], $certData['crt']) === 0) {
-            $certRefId = $existingCert['refid']; 
-            break;
-        }
+
+foreach ($certStore as $existingCert) {
+    if (strcmp($existingCert['crt'], $certData['crt']) === 0) {
+        $certRefId = $existingCert['refid']; 
+        break;
     }
 }
 
@@ -139,29 +220,26 @@ if (! $certRefId) {
 // Find expired certificates we imported
 $newCertStore = [];
 $expiredCerts = [];
-if (null !== $certStore) {
-    foreach ($certStore as $existingCert) {
-        $crt = base64_decode($existingCert['crt'], true);
-        if (false !== $crt) {
-            $certInfo = openssl_x509_parse($crt);
+foreach ($certStore as $existingCert) {
+    $crt = base64_decode($existingCert['crt'], true);
+    if (false !== $crt) {
+        $certInfo = openssl_x509_parse($crt);
 
-            if ($certInfo['validFrom_time_t'] > time() || $certInfo['validTo_time_t'] < time()) {
-                // check CN
-                $cn = $certInfo['subject']['CN'] ?? null;
-                if (strcmp($host, $cn) !== 0) {
-                    continue;
-                }
-
-                // check description
-                $searchPattern = '/^Imported via opnsense-import-ssl on [0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[1-2][0-9]|3[0-1])$/';
-                if (preg_match($searchPattern, $existingCert['descr'])) {
-                    echo sprintf("Expired certificate: %s.\r\n", $existingCert['descr']);
-
-                    $expiredCerts[] = $existingCert;
-                } 
-            } else {
-                $newCertStore[] = $existingCert;
+        if ($certInfo['validFrom_time_t'] > time() || $certInfo['validTo_time_t'] < time()) {
+            // check CN
+            if (!$coversHost($certInfo, $host)) {
+                continue;
             }
+
+            // check description
+            $searchPattern = '/^Imported via opnsense-import-ssl on [0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[1-2][0-9]|3[0-1])$/';
+	    if (!empty($existingCert['descr']) && preg_match($searchPattern, $existingCert['descr'])) {
+                echo sprintf("Expired certificate: %s.\r\n", $existingCert['descr']);
+
+                $expiredCerts[] = $existingCert;
+            } 
+        } else {
+            $newCertStore[] = $existingCert;
         }
     }
 }
