@@ -80,6 +80,7 @@ if (! openssl_x509_check_private_key($cert, $key)) {
 $allowedIssuers = [
     'O=Let\'s Encrypt, CN=E5, C=US',
     'O=Let\'s Encrypt, CN=E6, C=US',
+    'O=Let\'s Encrypt, CN=E8, C=US',
     'O=Let\'s Encrypt, CN=R3, C=US',
     'O=Let\'s Encrypt, CN=R10, C=US',
     'O=Let\'s Encrypt, CN=R11, C=US',
