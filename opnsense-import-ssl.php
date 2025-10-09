@@ -65,7 +65,7 @@ if (! file_exists($argv[2])) {
 }
 
 $key = trim(file_get_contents($argv[2]));
-if (! preg_match('/^-----BEGIN (RSA )?PRIVATE KEY-----(.*)-----END (RSA )?PRIVATE KEY-----$/s', $key)) {
+if (! preg_match('/^-----BEGIN( | RSA | EC | DSA | ED25519 )PRIVATE KEY-----(.*)-----END\1PRIVATE KEY-----$', $key)) {
     echo "The private key does not appear to be valid\r\n";
     die(1);
 }
